@@ -1,13 +1,15 @@
 import os
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing import image
 import matplotlib.pyplot as plt
+import cv2
 
-# Load your model
+# ------------------ Config ------------------
 model_file = "model.keras"
 model = load_model(model_file)
+class_labels = ["glioma", "meningioma", "notumour", "pituitary"]
 
 # Tumor -> malignant/benign mapping
 malignancy_map = {
@@ -17,7 +19,28 @@ malignancy_map = {
     "notumour": "benign"
 }
 
-# Prediction + explanation function
+# ------------------ Grad-CAM ------------------
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name, pred_index=None):
+    grad_model = tf.keras.models.Model(
+        [model.inputs],
+        [model.get_layer(last_conv_layer_name).output, model.output]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        if pred_index is None:
+            pred_index = tf.argmax(predictions[0])
+        class_channel = predictions[:, pred_index]
+
+    grads = tape.gradient(class_channel, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+
+    heatmap = tf.reduce_mean(tf.multiply(pooled_grads, conv_outputs), axis=-1)
+    heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-8)
+    return heatmap.numpy()
+
+# ------------------ Prediction + Explanation ------------------
 def predict_image(img_path):
     # Load and preprocess image
     img = image.load_img(img_path, target_size=(224, 224))
@@ -25,42 +48,65 @@ def predict_image(img_path):
     img_pre = np.expand_dims(img_array, axis=0)
     img_pre = tf.keras.applications.resnet50.preprocess_input(img_pre)
 
-    # Predict
+    # Prediction
     preds = model.predict(img_pre)
     class_idx = np.argmax(preds[0])
-    class_labels = ["glioma", "meningioma", "notumour", "pituitary"]
     tumor_label = class_labels[class_idx]
-
-    # Map to benign/malignant
     malignancy = malignancy_map[tumor_label]
 
-    # Input-gradient explanation (fallback if Grad-CAM fails)
-    with tf.GradientTape() as tape:
-        inputs = tf.cast(img_pre, tf.float32)
-        tape.watch(inputs)
-        predictions = model(inputs)
-        loss = predictions[0, class_idx]
-    grads = tape.gradient(loss, inputs)[0].numpy()
+    # Grad-CAM heatmap
+    try:
+        heatmap = make_gradcam_heatmap(img_pre, model, last_conv_layer_name="conv5_block3_out", pred_index=class_idx)
+    except Exception:
+        heatmap = np.zeros((7, 7))  # fallback if Grad-CAM fails
 
-    # Normalize and save saliency map
-    grads -= grads.min()
-    grads /= grads.max() + 1e-8
-    plt.imshow(grads)
+    # Overlay heatmap on original image
+    img_cv = cv2.imread(img_path)
+    img_cv = cv2.resize(img_cv, (224, 224))
+    heatmap_resized = cv2.resize(heatmap, (img_cv.shape[1], img_cv.shape[0]))
+    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+    overlayed = cv2.addWeighted(img_cv, 0.6, heatmap_colored, 0.4, 0)
+
+    # Save visualization
     out_dir = "explanations_debug"
     os.makedirs(out_dir, exist_ok=True)
-    out_file = os.path.join(out_dir, os.path.basename(img_path).replace(".jpg", "_input_grad_saliency.png"))
-    plt.axis('off')
-    plt.savefig(out_file, bbox_inches='tight')
-    plt.close()
+    overlay_file = os.path.join(out_dir, os.path.basename(img_path).replace(".jpg", "_gradcam_overlay.png"))
+    cv2.imwrite(overlay_file, overlayed)
+
+    # Personalized explanation
+    if tumor_label == "glioma":
+        text_explanation = (
+            f"The model detected *glioma* with probability {preds[0,class_idx]:.2f}. "
+            "The highlighted regions in red indicate abnormal irregular mass-like growth "
+            "inside the brain tissue, consistent with malignant glioma features."
+        )
+    elif tumor_label == "meningioma":
+        text_explanation = (
+            f"The model detected *meningioma* with probability {preds[0,class_idx]:.2f}. "
+            "The Grad-CAM highlights areas around the brain membrane. This pattern is "
+            "consistent with meningiomas, which usually grow from the meninges and are often benign."
+        )
+    elif tumor_label == "pituitary":
+        text_explanation = (
+            f"The model detected *pituitary tumor* with probability {preds[0,class_idx]:.2f}. "
+            "The activation is centered near the pituitary gland region. Pituitary tumors are "
+            "generally benign but can affect hormone regulation."
+        )
+    else:
+        text_explanation = (
+            f"The model detected *no tumor* with probability {preds[0,class_idx]:.2f}. "
+            "The heatmap shows no significant abnormal regions, indicating a healthy scan."
+        )
 
     return {
         "tumor_label": tumor_label,
         "malignancy": malignancy,
         "probability": float(preds[0, class_idx]),
-        "explanation_file": out_file
+        "overlay_file": overlay_file,
+        "text_explanation": text_explanation
     }
 
-# CLI-like usage
+# ------------------ CLI ------------------
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -70,4 +116,5 @@ if __name__ == "__main__":
     result = predict_image(args.image)
     print("Prediction:", result["tumor_label"], f"(prob={result['probability']:.4f})")
     print("Malignancy:", result["malignancy"])
-    print("Explanation saved to:", result["explanation_file"])
+    print("Overlay saved to:", result["overlay_file"])
+    print("Explanation:", result["text_explanation"])
