@@ -1,239 +1,292 @@
 import os
+import json
+import math
 import argparse
-from datetime import datetime
+from collections import Counter, defaultdict
 import numpy as np
-import cv2
-from PIL import Image, ImageFont, ImageDraw
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.applications import EfficientNetB0
+from tensorflow.keras.applications.efficientnet import preprocess_input as effnet_preprocess
 
-# ---------- Config ----------
+# --------------------------- Config Defaults ---------------------------
+CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]  # must match your explainer
+IMG_SIZE = 224
+BATCH_SIZE = 16
+EPOCHS_FREEZE = 12           # stage 1: train top
+EPOCHS_FT = 12               # stage 2: fine-tune backbone
+INIT_LR = 1e-4
+FT_LR = 2e-5
+VAL_SPLIT = 0.15
 MODEL_FILE = "model.keras"
-OUT_DIR = "explanations"
-IMG_INPUT_SIZE = (224, 224)   # model input size
-CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
-MALIGNANCY_MAP = {"glioma": "malignant", "meningioma": "benign", "pituitary": "benign", "notumor": "benign"}
-os.makedirs(OUT_DIR, exist_ok=True)
+LABELS_FILE = "class_names.json"
+SEED = 42
+AUTOTUNE = tf.data.AUTOTUNE
 
-# ---------- Helpers ----------
-def get_resnet_backbone(model):
-    # try direct name
-    try:
-        return model.get_layer("resnet50")
-    except Exception:
-        # search for nested model with 'resnet' in name
-        for layer in model.layers:
-            if isinstance(layer, tf.keras.Model) and 'resnet' in layer.name.lower():
-                return layer
-    return None
-
-def find_last_conv_name(resnet_backbone):
-    # return last Conv2D layer name inside a model
-    for l in reversed(resnet_backbone.layers):
-        if isinstance(l, tf.keras.layers.Conv2D):
-            return l.name
-    raise RuntimeError("No Conv2D layer found in backbone")
-
-def preprocess_for_model(img_path):
-    # load and preprocess for model (RGB)
-    img = Image.open(img_path).convert("RGB")
-    orig_w, orig_h = img.size
-    in_img = img.resize(IMG_INPUT_SIZE, Image.BICUBIC)
-    arr = np.array(in_img).astype("float32")
-    # Use resnet50 preprocess
-    arr = tf.keras.applications.resnet50.preprocess_input(arr)
-    arr = np.expand_dims(arr, axis=0)
-    return img, arr  # orig PIL Image, preprocessed batch
-
-def compute_gradcam(model, img_pre, conv_layer_name, pred_index):
-    """
-    Build grad_model by re-rooting the conv layer into top-level graph (safe).
-    Returns heatmap (H_conv, W_conv) normalized to [0,1] or None if fails.
-    """
-    # find backbone (resnet) and conv layer
-    resnet = get_resnet_backbone(model)
-    if resnet is None:
-        raise RuntimeError("ResNet backbone not found inside model")
-
-    try:
-        conv_layer = resnet.get_layer(conv_layer_name)
-    except Exception as e:
-        raise RuntimeError(f"Conv layer {conv_layer_name} not found in backbone: {e}")
-
-    # re-root conv output into top-level graph by applying conv_model to model.inputs[0] symbolically
-    conv_model = tf.keras.Model(inputs=resnet.inputs, outputs=conv_layer.output)
-    # conv_on_top is a symbolic tensor in top-level graph
-    conv_on_top = conv_model(model.inputs[0])
-    grad_model = tf.keras.Model(inputs=model.inputs, outputs=[conv_on_top, model.output])
-
-    img_tensor = tf.convert_to_tensor(img_pre, dtype=tf.float32)
-
-    with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_tensor, training=False)
-        tape.watch(conv_outputs)                # ensure tape watches intermediate activations
-        if pred_index is None:
-            pred_index = tf.argmax(predictions[0])
-        class_channel = predictions[:, pred_index]
-
-    grads = tape.gradient(class_channel, conv_outputs)
-    if grads is None:
-        return None
-
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs = conv_outputs[0]  # H x W x C
-
-    # Weighted sum
-    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-    heatmap = tf.nn.relu(heatmap)
-    max_val = tf.reduce_max(heatmap)
-    if tf.math.is_nan(max_val) or max_val == 0:
-        return None
-    heatmap = heatmap / (max_val + 1e-8)
-    return heatmap.numpy()
-
-def input_gradient_saliency(model, img_pre, class_idx):
-    x = tf.convert_to_tensor(img_pre, dtype=tf.float32)
-    with tf.GradientTape() as tape:
-        tape.watch(x)
-        preds = model(x, training=False)
-        if class_idx is None:
-            class_idx = tf.argmax(preds[0])
-        score = preds[:, class_idx]
-    grads = tape.gradient(score, x)  # 1,H,W,3
-    if grads is None:
-        return None
-    sal = tf.reduce_mean(tf.abs(grads), axis=-1)[0].numpy()
-    sal -= sal.min()
-    if sal.max() > 0:
-        sal /= (sal.max() + 1e-8)
-    return sal
-
-def apply_colormap_overlay(orig_pil, heatmap, alpha=0.6, boost=1.5):
-    """
-    orig_pil: PIL.Image RGB original (full size)
-    heatmap: 2D array normalized [0,1] at arbitrary size -> will be resized to original size
-    returns: overlay_bgr (uint8 BGR), annotated PIL for further drawing
-    """
-    orig = np.array(orig_pil)  # HxWx3 RGB
-    H, W = orig.shape[:2]
-    hm_resized = cv2.resize((heatmap*255).astype(np.uint8), (W, H), interpolation=cv2.INTER_LINEAR)
-    colormap = cv2.applyColorMap(hm_resized, cv2.COLORMAP_JET)  # BGR
-    # boost intensity
-    colormap = cv2.convertScaleAbs(colormap, alpha=boost, beta=0)
-    overlay_bgr = cv2.addWeighted(cv2.cvtColor(orig, cv2.COLOR_RGB2BGR), 1 - alpha, colormap, alpha, 0)
-    return overlay_bgr, hm_resized.astype(np.float32)/255.0  # overlay BGR, hm in [0,1]
-
-def annotate_and_label(overlay_bgr, heatmap_resized, label_text, prob, malignancy, threshold=0.45):
-    """
-    Draw bounding boxes around hotspots and write label+prob+malignancy.
-    """
-    overlay = overlay_bgr.copy()
-    hm = (heatmap_resized.copy()*255).astype(np.uint8)
-    _, mask = cv2.threshold(hm, int(255*threshold), 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    drawn = 0
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 50:  # skip tiny
-            continue
-        x,y,w,h = cv2.boundingRect(cnt)
-        cv2.rectangle(overlay, (x,y), (x+w, y+h), (0,255,255), 2)
-        cv2.putText(overlay, f"{label_text} ({prob*100:.1f}%)", (x, max(20,y-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
-        drawn += 1
-
-    # top-left summary text
-    txt = f"{label_text} | {malignancy} | {prob*100:.1f}%"
-    cv2.rectangle(overlay, (2,2), (min(400, overlay.shape[1]-4), 28), (0,0,0), -1)
-    cv2.putText(overlay, txt, (6,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-    return overlay
-
-# ---------- Main flow ----------
-def explain_image(img_path):
-    # load model
-    model = load_model(MODEL_FILE, compile=False)
-
-    # preprocess
-    orig_pil, img_pre = preprocess_for_model(img_path := img_path)  # original PIL and preprocessed batch
-
-    # prediction
-    preds = model.predict(img_pre, verbose=0)
-    class_idx = int(np.argmax(preds[0]))
-    label = CLASS_NAMES[class_idx]
-    prob = float(preds[0][class_idx])
-    malignancy = MALIGNANCY_MAP[label]
-
-    # attempt to compute Grad-CAM using last conv layer detected inside backbone
-    resnet = get_resnet_backbone(model)
-    heatmap = None
-    used_method = None
-    if resnet is not None:
+# --------------------------- Utils ---------------------------
+def set_mixed_precision(enable=True):
+    if enable:
         try:
-            last_conv_name = find_last_conv_name(resnet)
-            heatmap = compute_gradcam(model, img_pre, last_conv_name, pred_index=class_idx)
-            if heatmap is not None:
-                used_method = f"gradcam:{last_conv_name}"
-        except Exception:
-            heatmap = None
+            from tensorflow.keras import mixed_precision
+            mixed_precision.set_global_policy("mixed_float16")
+            print("[INFO] Mixed precision enabled.")
+        except Exception as e:
+            print(f"[WARN] Mixed precision not enabled: {e}")
 
-    # fallback to input-gradient saliency
-    if heatmap is None:
-        heatmap = input_gradient_saliency(model, img_pre, class_idx)
-        used_method = "input_gradient_saliency"
+def fix_seeds(seed=SEED):
+    tf.keras.utils.set_random_seed(seed)
+    tf.config.experimental.enable_op_determinism()
 
-    # ensure heatmap exists
-    if heatmap is None:
-        raise RuntimeError("Could not compute any explanation map")
+def list_counts_per_class(train_dir, class_names):
+    counts = {}
+    for cname in class_names:
+        cdir = os.path.join(train_dir, cname)
+        if not os.path.isdir(cdir):
+            raise FileNotFoundError(f"Missing class folder: {cdir}")
+        total = sum(1 for root, _, files in os.walk(cdir) for f in files if f.lower().endswith((".png",".jpg",".jpeg",".bmp")))
+        counts[cname] = total
+    return counts
 
-    # overlay & annotate
-    overlay_bgr, hm_resized = apply_colormap_overlay(orig_pil, heatmap, alpha=0.6, boost=1.6)
-    annotated = annotate_and_label(overlay_bgr, hm_resized, label, prob, malignancy, threshold=0.45)
+def compute_class_weights(counts_dict):
+    # Inverse frequency class weights: weight_c = N_total / (num_classes * count_c)
+    total = sum(counts_dict.values())
+    num_classes = len(counts_dict)
+    weights = {}
+    for i, cname in enumerate(CLASS_NAMES):
+        c = counts_dict[cname]
+        weights[i] = (total / (num_classes * max(c, 1)))
+    return weights
 
-    # save output image
-    base = os.path.splitext(os.path.basename(img_path))[0]
-    out_name = f"{base}_explain_{datetime.now().strftime('%H%M%S')}.png"
-    out_path = os.path.join(OUT_DIR, out_name)
-    cv2.imwrite(out_path, annotated)
+def make_datasets(data_dir, img_size, batch_size, val_split, class_names, seed):
+    train_dir = os.path.join(data_dir, "Training")
+    test_dir = os.path.join(data_dir, "Testing")  # optional
 
-    # text explanation (tailored + references overlay)
-    tailored = {
-        "glioma": ("Glioma (malignant): model focused on irregular, infiltrative regions inside brain tissue. "
-                   "These highlighted areas (see image) likely correspond to tumor mass and infiltration."),
-        "meningioma": ("Meningioma (usually benign): model attention is extra-axial and well-circumscribed, "
-                       "consistent with meningioma near the meningeal surface."),
-        "pituitary": ("Pituitary tumor (usually benign): model highlights around sella turcica / pituitary region."),
-        "notumor": ("No tumor detected: no focal regions of strong activation were found.")
-    }
-    explanation_text = tailored.get(label, "")
+    # Force class order to match CLASS_NAMES for consistency with explainer
+    train_ds = tf.keras.utils.image_dataset_from_directory(
+        train_dir,
+        labels="inferred",
+        label_mode="int",
+        color_mode="rgb",
+        batch_size=batch_size,
+        image_size=(img_size, img_size),
+        shuffle=True,
+        seed=seed,
+        validation_split=val_split,
+        subset="training",
+        class_names=class_names,
+    )
 
-    # print everything
-    print(f"\nPrediction: {label} (prob={prob:.4f})")
-    print(f"Malignancy: {malignancy}")
-    print(f"Explain method: {used_method}")
-    print(f"Overlay saved to: {out_path}")
-    print(f"\nText explanation:\n{explanation_text}\n")
+    val_ds = tf.keras.utils.image_dataset_from_directory(
+        train_dir,
+        labels="inferred",
+        label_mode="int",
+        color_mode="rgb",
+        batch_size=batch_size,
+        image_size=(img_size, img_size),
+        shuffle=True,
+        seed=seed,
+        validation_split=val_split,
+        subset="validation",
+        class_names=class_names,
+    )
 
-    return out_path
+    test_ds = None
+    if os.path.isdir(test_dir):
+        test_ds = tf.keras.utils.image_dataset_from_directory(
+            test_dir,
+            labels="inferred",
+            label_mode="int",
+            color_mode="rgb",
+            batch_size=batch_size,
+            image_size=(img_size, img_size),
+            shuffle=False,
+            class_names=class_names,
+        )
 
-# ---------- CLI ----------
-def preprocess_for_model(img_path):
-    # return original PIL Image and preprocessed array for model
-    pil = Image.open(img_path).convert("RGB")
-    # for model
-    resized = pil.resize(IMG_INPUT_SIZE, Image.BILINEAR)
-    arr = np.array(resized).astype("float32")
-    arr = tf.keras.applications.resnet50.preprocess_input(arr)  # important preprocessing
-    arr = np.expand_dims(arr, axis=0)
-    return pil, arr
+    # Cache + prefetch for performance
+    def prep(ds, training=False):
+        ds = ds.map(lambda x, y: (tf.cast(x, tf.float32), y), num_parallel_calls=AUTOTUNE)
+        ds = ds.cache()
+        if training:
+            ds = ds.shuffle(1024, seed=seed)
+        ds = ds.prefetch(AUTOTUNE)
+        return ds
+
+    return prep(train_ds, training=True), prep(val_ds, training=False), (prep(test_ds, training=False) if test_ds else None)
+
+def build_model(img_size, num_classes, dropout=0.4, train_base=False):
+    inputs = layers.Input(shape=(img_size, img_size, 3))
+
+    # Data augmentation inside the graph
+    aug = keras.Sequential(
+        [
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(0.1),
+            layers.RandomZoom(0.1),
+            layers.RandomTranslation(0.05, 0.05),
+        ],
+        name="augmentation",
+    )
+
+    x = aug(inputs)
+    x = layers.Lambda(effnet_preprocess, name="preprocess")(x)
+
+    base = EfficientNetB0(include_top=False, weights="imagenet", input_tensor=x)
+    base.trainable = train_base  # stage 1: False; stage 2: True (partial)
+
+    x = layers.GlobalAveragePooling2D(name="gap")(base.output)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(dropout)(x)
+    # Important: for mixed_precision, final dtype float32
+    outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+
+    model = keras.Model(inputs, outputs, name="BrainTumor_EfficientNetB0")
+    return model, base
+
+def compile_model(model, lr):
+    opt = keras.optimizers.Adam(learning_rate=lr)
+    model.compile(
+        optimizer=opt,
+        loss="sparse_categorical_crossentropy",
+        metrics=[
+            "accuracy",
+            keras.metrics.AUC(name="auc", multi_label=False, num_thresholds=200),
+        ],
+    )
+
+def fine_tune_setup(base_model, num_unfreeze=80):
+    # Unfreeze top N layers of EfficientNet for fine-tuning
+    total = len(base_model.layers)
+    unfreeze_from = max(0, total - num_unfreeze)
+    for i, layer in enumerate(base_model.layers):
+        layer.trainable = (i >= unfreeze_from)
+
+    print(f"[INFO] Fine-tuning enabled. Unfrozen layers from index {unfreeze_from}/{total} (~{num_unfreeze} layers).")
+
+def train_and_finetune(
+    data_dir,
+    img_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    init_lr=INIT_LR,
+    ft_lr=FT_LR,
+    epochs_freeze=EPOCHS_FREEZE,
+    epochs_ft=EPOCHS_FT,
+    val_split=VAL_SPLIT,
+    model_file=MODEL_FILE,
+    enable_mixed_precision=True,
+):
+    # Determinism
+    fix_seeds(SEED)
+    set_mixed_precision(enable_mixed_precision)
+
+    # Datasets
+    train_ds, val_ds, test_ds = make_datasets(data_dir, img_size, batch_size, val_split, CLASS_NAMES, SEED)
+
+    # Class weights from directory counts (Training)
+    counts = list_counts_per_class(os.path.join(data_dir, "Training"), CLASS_NAMES)
+    print("[INFO] Training image counts per class:", counts)
+    class_weights = compute_class_weights(counts)
+    print("[INFO] Computed class weights:", class_weights)
+
+    # Build model (stage 1)
+    model, base = build_model(img_size, num_classes=len(CLASS_NAMES), dropout=0.4, train_base=False)
+    compile_model(model, init_lr)
+
+    # Callbacks
+    ckpt = ModelCheckpoint(model_file, monitor="val_loss", save_best_only=True, verbose=1)
+    es = EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True, verbose=1)
+    rlrop = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-7, verbose=1)
+
+    # Stage 1: Train head
+    print("\n[STAGE 1] Training classification head (backbone frozen)...")
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs_freeze,
+        class_weight=class_weights,
+        callbacks=[ckpt, es, rlrop],
+        verbose=2,
+    )
+
+    # Stage 2: Fine-tune
+    print("\n[STAGE 2] Fine-tuning backbone...")
+    fine_tune_setup(base, num_unfreeze=80)
+    compile_model(model, ft_lr)
+    es2 = EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True, verbose=1)
+    rlrop2 = ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, min_lr=1e-7, verbose=1)
+    ckpt2 = ModelCheckpoint(model_file, monitor="val_loss", save_best_only=True, verbose=1)
+
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs_ft,
+        class_weight=class_weights,
+        callbacks=[ckpt2, es2, rlrop2],
+        verbose=2,
+    )
+
+    # Ensure final best model is on disk and in memory
+    model.save(model_file)
+    print(f"[INFO] Saved best model to {model_file}")
+
+    # Save class name order for reference/debug
+    with open(LABELS_FILE, "w") as f:
+        json.dump(CLASS_NAMES, f)
+    print(f"[INFO] Saved class names to {LABELS_FILE}")
+
+    # Evaluate
+    print("\n[EVAL] Validation set:")
+    val_metrics = model.evaluate(val_ds, verbose=0)
+    for name, val in zip(model.metrics_names, val_metrics):
+        print(f"  {name}: {val:.4f}")
+
+    if test_ds is not None:
+        print("\n[EVAL] Testing set:")
+        test_metrics = model.evaluate(test_ds, verbose=0)
+        for name, val in zip(model.metrics_names, test_metrics):
+            print(f"  {name}: {val:.4f}")
+
+        # Optional: confusion matrix
+        try:
+            y_true = np.concatenate([y.numpy() for _, y in test_ds], axis=0)
+            y_pred = []
+            for x, _ in test_ds:
+                prob = model.predict(x, verbose=0)
+                y_pred.append(np.argmax(prob, axis=1))
+            y_pred = np.concatenate(y_pred, axis=0)
+            cm = tf.math.confusion_matrix(y_true, y_pred, num_classes=len(CLASS_NAMES)).numpy()
+            print("\nConfusion Matrix (rows=true, cols=pred):\n", cm)
+        except Exception as e:
+            print(f"[WARN] Could not compute confusion matrix: {e}")
+
+    print("\n[DONE] Training complete. Use model.keras with your explain script.")
+
+# --------------------------- CLI ---------------------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="Train brain tumor classifier with EfficientNetB0")
+    ap.add_argument("--data_dir", required=True, help="Path to dataset folder containing Training/ (and optional Testing/)")
+    ap.add_argument("--img_size", type=int, default=IMG_SIZE)
+    ap.add_argument("--batch_size", type=int, default=BATCH_SIZE)
+    ap.add_argument("--epochs_freeze", type=int, default=EPOCHS_FREEZE)
+    ap.add_argument("--epochs_ft", type=int, default=EPOCHS_FT)
+    ap.add_argument("--init_lr", type=float, default=INIT_LR)
+    ap.add_argument("--ft_lr", type=float, default=FT_LR)
+    ap.add_argument("--val_split", type=float, default=VAL_SPLIT)
+    ap.add_argument("--no_mixed_precision", action="store_true", help="Disable mixed precision")
+    return ap.parse_args()
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--image", required=True, help="path to image")
-    args = p.parse_args()
-
-    out = explain_image(args.image)
-    # optionally open with default system viewer (uncomment if desired)
-    # import subprocess, platform
-    # if platform.system() == "Windows":
-    #     os.startfile(out)
-    # else:
-    #     subprocess.call(["xdg-open", out])
+    args = parse_args()
+    train_and_finetune(
+        data_dir=args.data_dir,
+        img_size=args.img_size,
+        batch_size=args.batch_size,
+        init_lr=args.init_lr,
+        ft_lr=args.ft_lr,
+        epochs_freeze=args.epochs_freeze,
+        epochs_ft=args.epochs_ft,
+        val_split=args.val_split,
+        enable_mixed_precision=(not args.no_mixed_precision),
+    )

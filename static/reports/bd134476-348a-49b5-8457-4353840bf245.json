@@ -1,0 +1,11 @@
+{
+  "report_id": "bd134476-348a-49b5-8457-4353840bf245",
+  "uploaded_filename": "fggg.jpg",
+  "pred_label": "",
+  "malignancy": "Benign",
+  "confidence": 0.0,
+  "summary": "Automated MRI analysis indicates  with confidence 0.00%. Clinical mapping suggests this is 'Benign'. This AI output is informational and should be reviewed by a radiologist.",
+  "gradcam_url": null,
+  "audio_url": "/static/audio/bd134476-348a-49b5-8457-4353840bf245.mp3",
+  "pdf_url": "/static/reports/bd134476-348a-49b5-8457-4353840bf245.pdf"
+}
